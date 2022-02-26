@@ -217,6 +217,8 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
         else:
             self.output_layer = None
 
+    
+
     def forward(self, tgt, tgt_mask, memory, memory_mask):
         """Forward decoder.
 
@@ -248,6 +250,57 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
         if self.output_layer is not None:
             x = self.output_layer(x)
         return x, tgt_mask
+
+    def forward_ilm(self, tgt, tgt_mask, memory, memory_mask):
+        """Forward decoder.
+
+        Args:
+            tgt (torch.Tensor): Input token ids, int64 (#batch, maxlen_out) if
+                input_layer == "embed". In the other case, input tensor
+                (#batch, maxlen_out, odim).
+            tgt_mask (torch.Tensor): Input token mask (#batch, maxlen_out).
+                dtype=torch.uint8 in PyTorch 1.2- and dtype=torch.bool in PyTorch 1.2+
+                (include 1.2).
+            memory (torch.Tensor): Encoded memory, float32 (#batch, maxlen_in, feat).
+            memory_mask (torch.Tensor): Encoded memory mask (#batch, maxlen_in).
+                dtype=torch.uint8 in PyTorch 1.2- and dtype=torch.bool in PyTorch 1.2+
+                (include 1.2).
+
+        Returns:
+            torch.Tensor: Decoded token score before softmax (#batch, maxlen_out, odim)
+                   if use_output_layer is True. In the other case,final block outputs
+                   (#batch, maxlen_out, attention_dim).
+            torch.Tensor: Score mask before softmax (#batch, maxlen_out).
+
+        """
+        x = self.embed(tgt)
+        x, tgt_mask, _, _ = self.decoders(
+            x, tgt_mask, -1, -1, ilm=True
+        )
+        if self.normalize_before:
+            x = self.after_norm(x)
+        if self.output_layer is not None:
+            x = self.output_layer(x)
+        return x, tgt_mask
+
+
+    def init_ilme(self,args):
+        #这个函数需要在__init__之后调用
+        self.decoder_parameter = list(self.parameters())
+        decoder_layers = list(self.decoders)
+        if "tsf_share" in args and args["tsf_share"]==True:  # set to True, no difference
+            decoder_layers[0].init_ilme(args)
+            self.ilme_parameter = decoder_layers[0].ilme_parameter
+            for layer in decoder_layers[1:]:
+                layer.src_attn.ilme=decoder_layers[0].src_attn.ilme
+
+        else:
+
+            self.ilme_parameter=[]
+            for layer in decoder_layers:
+                layer.init_ilme(args)
+                self.ilme_parameter = self.ilme_parameter+layer.ilme_parameter
+
 
     def forward_one_step(self, tgt, tgt_mask, memory, cache=None):
         """Forward one step.
@@ -285,6 +338,43 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
 
         return y, new_cache
 
+
+    def forward_one_step_ilm(self, tgt, tgt_mask, memory, cache=None):
+        """Forward one step.
+
+        Args:
+            tgt (torch.Tensor): Input token ids, int64 (#batch, maxlen_out).
+            tgt_mask (torch.Tensor): Input token mask (#batch, maxlen_out).
+                dtype=torch.uint8 in PyTorch 1.2- and dtype=torch.bool in PyTorch 1.2+
+                (include 1.2).
+            memory (torch.Tensor): Encoded memory, float32 (#batch, maxlen_in, feat).
+            cache (List[torch.Tensor]): List of cached tensors.
+                Each tensor shape should be (#batch, maxlen_out - 1, size).
+
+        Returns:
+            torch.Tensor: Output tensor (batch, maxlen_out, odim).
+            List[torch.Tensor]: List of cache tensors of each decoder layer.
+
+        """
+        x = self.embed(tgt)
+        if cache is None:
+            cache = [None] * len(self.decoders)
+        new_cache = []
+        for c, decoder in zip(cache, self.decoders):
+            x, tgt_mask, _, memory_mask = decoder.forward_ilm(
+                x, tgt_mask, -1, None, cache=c
+            )
+            new_cache.append(x)
+
+        if self.normalize_before:
+            y = self.after_norm(x[:, -1])
+        else:
+            y = x[:, -1]
+        if self.output_layer is not None:
+            y = torch.log_softmax(self.output_layer(y), dim=-1)
+
+        return y, new_cache    
+
     # beam search API (see ScorerInterface)
     def score(self, ys, state, x):
         """Score."""
@@ -300,7 +390,24 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
         )
         return logp.squeeze(0), state
 
+    
+    def score_ilm(self, ys, state, x):
+        """Score."""
+        ys_mask = subsequent_mask(len(ys), device=x.device).unsqueeze(0)
+        if self.selfattention_layer_type != "selfattn":
+            # TODO(karita): implement cache
+            logging.warning(
+                f"{self.selfattention_layer_type} does not support cached decoding."
+            )
+            state = None
+        logp, state = self.forward_one_step_ilm(
+            ys.unsqueeze(0), ys_mask, x.unsqueeze(0), cache=state
+        )
+        return logp.squeeze(0), state
+
     # batch beam search API (see BatchScorerInterface)
+
+
     def batch_score(
         self, ys: torch.Tensor, states: List[Any], xs: torch.Tensor
     ) -> Tuple[torch.Tensor, List[Any]]:
@@ -333,6 +440,44 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
         # batch decoding
         ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
         logp, states = self.forward_one_step(ys, ys_mask, xs, cache=batch_state)
+
+        # transpose state of [layer, batch] into [batch, layer]
+        state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]
+        return logp, state_list
+
+
+    def batch_score_ilm(
+        self, ys: torch.Tensor, states: List[Any], xs: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[Any]]:
+        """Score new token batch (required).
+
+        Args:
+            ys (torch.Tensor): torch.int64 prefix tokens (n_batch, ylen).
+            states (List[Any]): Scorer states for prefix tokens.
+            xs (torch.Tensor):
+                The encoder feature that generates ys (n_batch, xlen, n_feat).
+
+        Returns:
+            tuple[torch.Tensor, List[Any]]: Tuple of
+                batchfied scores for next token with shape of `(n_batch, n_vocab)`
+                and next state list for ys.
+
+        """
+        # merge states
+        n_batch = len(ys)
+        n_layers = len(self.decoders)
+        if states[0] is None:
+            batch_state = None
+        else:
+            # transpose state of [batch, layer] into [layer, batch]
+            batch_state = [
+                torch.stack([states[b][i] for b in range(n_batch)])
+                for i in range(n_layers)
+            ]
+
+        # batch decoding
+        ys_mask = subsequent_mask(ys.size(-1), device=xs.device).unsqueeze(0)
+        logp, states = self.forward_one_step_ilm(ys, ys_mask, xs, cache=batch_state)
 
         # transpose state of [layer, batch] into [batch, layer]
         state_list = [[states[i][b] for i in range(n_layers)] for b in range(n_batch)]

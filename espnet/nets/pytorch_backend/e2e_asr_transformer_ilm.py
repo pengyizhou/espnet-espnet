@@ -171,7 +171,14 @@ class E2E(ASRInterface, torch.nn.Module):
         # initialize parameters
         initialize(self, args.transformer_init)
 
-    def forward(self, xs_pad, ilens, ys_pad):
+    def forward(self, xs_pad, ilens, ys_pad, forward_ilm=False):
+        if forward_ilm:
+            return self.forward_ilm(xs_pad, ilens, ys_pad)
+        else:
+            return self.forward_normal(xs_pad, ilens, ys_pad)
+
+
+    def forward_normal(self, xs_pad, ilens, ys_pad):
         """E2E forward.
 
         :param torch.Tensor xs_pad: batch of padded source sequences (B, Tmax, idim)
@@ -275,6 +282,54 @@ class E2E(ASRInterface, torch.nn.Module):
         else:
             logging.warning("loss (=%f) is not correct", loss_data)
         return self.loss
+
+
+    def forward_ilm(self, xs_pad, ilens, ys_pad):
+        """E2E forward.
+
+        :param torch.Tensor xs_pad: batch of padded source sequences (B, Tmax, idim)
+        :param torch.Tensor ilens: batch of lengths of source sequences (B)
+        :param torch.Tensor ys_pad: batch of padded target sequences (B, Lmax)
+        :return: ctc loss value
+        :rtype: torch.Tensor
+        :return: attention loss value
+        :rtype: torch.Tensor
+        :return: accuracy in attention decoder
+        :rtype: float
+        """
+        # # 1. forward encoder
+        # xs_pad = xs_pad[:, : max(ilens)]  # for data parallel
+        # src_mask = make_non_pad_mask(ilens.tolist()).to(xs_pad.device).unsqueeze(-2)
+        # hs_pad, hs_mask, hs_intermediates = self.encoder(xs_pad, src_mask)
+        # self.hs_pad = hs_pad
+
+        # 2. forward decoder
+        batch_size = ys_pad.shape[0]
+        if self.decoder.forward_ilm is not None:
+            ys_in_pad, ys_out_pad = add_sos_eos(
+                ys_pad, self.sos, self.eos, self.ignore_id
+            )
+            
+            fake_encoder_out = xs_pad.new_zeros(batch_size, 1, self.encoder._output_size)
+            ys_mask = target_mask(ys_in_pad, self.ignore_id)
+            pred_pad, _ = self.decoder.forward_ilm(ys_in_pad, ys_mask, fake_encoder_out, -1)
+            # ys_mask = target_mask(ys_in_pad, self.ignore_id)
+            # pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
+            # self.pred_pad = pred_pad
+
+            # 3. compute attention loss
+            loss_ilm = self.criterion(pred_pad, ys_out_pad)
+            self.acc = th_accuracy(
+                pred_pad.view(-1, self.odim), ys_out_pad, ignore_label=self.ignore_id
+            )
+
+        else:
+            loss_ilm = None
+            self.acc = None
+        self.loss = loss_ilm + 1
+        
+        return self.loss
+
 
     def scorers(self):
         """Scorers."""

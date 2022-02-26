@@ -30,6 +30,7 @@ class MultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = n_feat // n_head
         self.h = n_head
+        self.n_feat=n_feat
         self.linear_q = nn.Linear(n_feat, n_feat)
         self.linear_k = nn.Linear(n_feat, n_feat)
         self.linear_v = nn.Linear(n_feat, n_feat)
